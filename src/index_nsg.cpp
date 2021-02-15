@@ -11,6 +11,12 @@
 
 namespace efanna2e {
 #define _CONTROL_NUM 100
+/*
+ * dimension:向量维度
+ * n: 向量个数
+ * m: 距离类型
+ * initializer: 没有用到。
+ */ 
 IndexNSG::IndexNSG(const size_t dimension, const size_t n, Metric m,
                    Index *initializer)
     : Index(dimension, n, m), initializer_{initializer} {}
@@ -31,6 +37,8 @@ void IndexNSG::Save(const char *filename) {
   out.close();
 }
 
+// width是图中邻接list里最大的长度。就是说，是图中邻居最多的点的邻居数。
+// ep_是导航点
 void IndexNSG::Load(const char *filename) {
   std::ifstream in(filename, std::ios::binary);
   in.read((char *)&width, sizeof(unsigned));
@@ -71,6 +79,24 @@ void IndexNSG::Load_nn_graph(const char *filename) {
   in.close();
 }
 
+/*
+ * 
+ * Algorithm 1 Search-on-Graph(G, p, q, l)
+Require: graph G, start node p, query point q, candidate pool size l
+Ensure: k nearest neighbors of q
+1: i=0, candidate pool S = ∅ 
+2: S.add(p)
+3: while i<l do
+4:  i =the index of the first unchecked node in S 
+5:  mark pi as checked 
+6:  for all neighbor n of pi in G do
+7:    S .add(n) 
+8:  end for
+9:  sort S in ascending order of the distance to q 
+10: If S.size() > l, S.resize(l)
+11: end while
+12: return the first k nodes in S
+ */
 void IndexNSG::get_neighbors(const float *query, const Parameters &parameter,
                              std::vector<Neighbor> &retset,
                              std::vector<Neighbor> &fullset) {
@@ -82,11 +108,13 @@ void IndexNSG::get_neighbors(const float *query, const Parameters &parameter,
 
   boost::dynamic_bitset<> flags{nd_, 0};
   L = 0;
+  // 从navigating point的邻居开始
   for (unsigned i = 0; i < init_ids.size() && i < final_graph_[ep_].size(); i++) {
     init_ids[i] = final_graph_[ep_][i];
     flags[init_ids[i]] = true;
     L++;
   }
+  // 如果navigating point的邻居数量不足，补充一些随机点，到参数L个。
   while (L < init_ids.size()) {
     unsigned id = rand() % nd_;
     if (flags[id]) continue;
@@ -208,6 +236,7 @@ void IndexNSG::get_neighbors(const float *query, const Parameters &parameter,
   }
 }
 
+// 计算数据质心，然后随机选择一个点开始搜索，计算质心的最近邻，把离质心最近的一个点做邻居。
 void IndexNSG::init_graph(const Parameters &parameters) {
   float *center = new float[dimension_];
   for (unsigned j = 0; j < dimension_; j++) center[j] = 0;
@@ -225,49 +254,91 @@ void IndexNSG::init_graph(const Parameters &parameters) {
   ep_ = tmp[0].id;
 }
 
-void IndexNSG::sync_prune(unsigned q, std::vector<Neighbor> &pool,
+/* 
+ *
+ * 对应论文里Algorithm 2里的第6-22行， 摘抄如下：
+6:    E =all the nodes checked along the search
+7:    add v’s nearest neighbors in G to E
+8:    sort E in the ascending order of the distance to v. 
+9:    result set R=∅,p0 =the closest node to v in E
+10:   R.add(p0 )
+11:   while !E.empty() && R.size() < m do
+12:     p = E.front()
+13:     E .remove(E .front()) 
+14:     for all node r in R do
+15:       if edge pv conflicts with edge pr then 
+16:         break
+17:       end if 
+18:     end for
+19:     if no conflicts occurs then 
+20:       R.add(p)
+21:     end if 
+22:   end while
+
+ * 这个方法的参数pool对应论文里的E，是候选集。如果里面的点如果满足了mrng的定义，就加入到结果集result里面。
+ */ 
+void IndexNSG::sync_prune(unsigned v, std::vector<Neighbor> &pool,
                           const Parameters &parameter,
                           boost::dynamic_bitset<> &flags,
                           SimpleNeighbor *cut_graph_) {
+  // controls the index size of the graph, the best R is related 
+  // to the intrinsic dimension of the dataset.
   unsigned range = parameter.Get<unsigned>("R");
+  // controls the maximum candidate pool size during NSG contruction.
   unsigned maxc = parameter.Get<unsigned>("C");
   width = range;
   unsigned start = 0;
 
-  for (unsigned nn = 0; nn < final_graph_[q].size(); nn++) {
-    unsigned id = final_graph_[q][nn];
+  // 这个for循环对应算法2第7行。
+  for (unsigned nn = 0; nn < final_graph_[v].size(); nn++) {
+    unsigned id = final_graph_[v][nn];
     if (flags[id]) continue;
     float dist =
-        distance_->compare(data_ + dimension_ * (size_t)q,
+        distance_->compare(data_ + dimension_ * (size_t)v,
                            data_ + dimension_ * (size_t)id, (unsigned)dimension_);
     pool.push_back(Neighbor(id, dist, true));
   }
 
+  // 对应第8行。pool里面从导航点ep_到v点所有搜索到的点。按距离取前R个。
   std::sort(pool.begin(), pool.end());
+  // 对应第9行
   std::vector<Neighbor> result;
-  if (pool[start].id == q) start++;
+  if (pool[start].id == v) start++;
+  // 对应第10行
   result.push_back(pool[start]);
 
   while (result.size() < range && (++start) < pool.size() && start < maxc) {
     auto &p = pool[start];
     bool occlude = false;
-    for (unsigned t = 0; t < result.size(); t++) {
-      if (p.id == result[t].id) {
+    for (unsigned r = 0; r < result.size(); r++) {
+      if (p.id == result[r].id) {
         occlude = true;
         break;
       }
-      float djk = distance_->compare(data_ + dimension_ * (size_t)result[t].id,
+      float pr = distance_->compare(data_ + dimension_ * (size_t)result[r].id,
                                      data_ + dimension_ * (size_t)p.id,
                                      (unsigned)dimension_);
-      if (djk < p.distance /* dik */) {
+      /* If any three nodes in the result set form a triangle and the two shorter edges 
+       form an alternative path to the longest one, the longest will be pruned (the occlusion rule). 
+      也就是说已经存在在result里面的点r（也就是说已经和v有边了）、v、候选点p三点形成的三角形里。
+      如果pv是长边，那么p不应该加到v的result里。因为mrng的定义就是: lune(pv)必定包含r，而pr已经有边了，所以pv不应该有边。
+      除此之外其他的情况都可以做边。
+          p
+           。   r
+            。 /    
+             v
+      */
+      if (pr < p.distance /* pv */) {
         occlude = true;
         break;
       }
     }
+    //对应19-21行
     if (!occlude) result.push_back(p);
   }
 
-  SimpleNeighbor *des_pool = cut_graph_ + (size_t)q * (size_t)range;
+  // 把result结果输出到cut_graph_里。
+  SimpleNeighbor *des_pool = cut_graph_ + (size_t)v * (size_t)range;
   for (size_t t = 0; t < result.size(); t++) {
     des_pool[t].id = result[t].id;
     des_pool[t].distance = result[t].distance;
@@ -277,6 +348,9 @@ void IndexNSG::sync_prune(unsigned q, std::vector<Neighbor> &pool,
   }
 }
 
+// 由于nsg是有向图，且n的邻居在link过程中已经改变，所以判断下n的邻居p，是否需要n作为他的邻居。
+// 如果p的邻居个数不超过R-1，p就n加入进来做邻居。
+// 如果p的邻居个数已经超过R-1,把n加进来之后，按距离排序，然后重新判断是否符合mrng定义。最后取R个邻居。
 void IndexNSG::InterInsert(unsigned n, unsigned range,
                            std::vector<std::mutex> &locks,
                            SimpleNeighbor *cut_graph_) {
@@ -312,15 +386,15 @@ void IndexNSG::InterInsert(unsigned n, unsigned range,
       while (result.size() < range && (++start) < temp_pool.size()) {
         auto &p = temp_pool[start];
         bool occlude = false;
-        for (unsigned t = 0; t < result.size(); t++) {
-          if (p.id == result[t].id) {
+        for (unsigned r = 0; r < result.size(); r++) {
+          if (p.id == result[r].id) {
             occlude = true;
             break;
           }
-          float djk = distance_->compare(data_ + dimension_ * (size_t)result[t].id,
+          float pr = distance_->compare(data_ + dimension_ * (size_t)result[r].id,
                                          data_ + dimension_ * (size_t)p.id,
                                          (unsigned)dimension_);
-          if (djk < p.distance /* dik */) {
+          if (pr < p.distance /* p->des */) {
             occlude = true;
             break;
           }
@@ -346,6 +420,9 @@ void IndexNSG::InterInsert(unsigned n, unsigned range,
   }
 }
 
+/*
+ * 对应论文里的算法4-23行。
+ */ 
 void IndexNSG::Link(const Parameters &parameters, SimpleNeighbor *cut_graph_) {
   /*
   std::cout << " graph link" << std::endl;
@@ -367,7 +444,9 @@ void IndexNSG::Link(const Parameters &parameters, SimpleNeighbor *cut_graph_) {
       pool.clear();
       tmp.clear();
       flags.reset();
+      // collect the edges along the search path from ep_ to n as candidates.
       get_neighbors(data_ + dimension_ * n, parameters, flags, tmp, pool);
+      // 看看是否满足mrng的定义。
       sync_prune(n, pool, parameters, flags, cut_graph_);
       /*
     cnt++;
@@ -385,16 +464,60 @@ void IndexNSG::Link(const Parameters &parameters, SimpleNeighbor *cut_graph_) {
   }
 }
 
+/*
+ *
+ * Algorithm 2 NSGbuild(G, l, m)
+Require: kNN Graph G, candidate pool size l for greedy search, max-out-degree m.
+Ensure: NSG with navigating node n
+1:  calculate the centroid c of the dataset.
+2:  r =random node.
+3:  n =Search-on-Graph(G,r,c,l)%navigating node 
+4:  for all node v in G do
+5:    Search-on-Graph(G,n,v,l)
+6:    E =all the nodes checked along the search
+7:    add v’s nearest neighbors in G to E
+8:    sort E in the ascending order of the distance to v. 
+9:    result set R=∅,p0 =the closest node to v in E
+10:   R.add(p0 )
+11:   while !E.empty() && R.size() < m do
+12:     p = E.front()
+13:     E .remove(E .front()) 
+14:     for all node r in R do
+15:       if edge pv conflicts with edge pr then 
+16:         break
+17:       end if 
+18:     end for
+19:     if no conflicts occurs then 
+20:       R.add(p)
+21:     end if 
+22:   end while
+23:  end for
+24:  while True do
+25:   build a tree with edges in NSG from root n with DFS. 
+26:   if not all nodes linked to the tree then
+27:     add an edge between one of the out-of-tree nodes and
+28:     its closest in-tree neighbor (by algorithm 1).
+29:   else
+30:     break.
+31:   end if 
+32: end while
+ * 
+ */ 
 void IndexNSG::Build(size_t n, const float *data, const Parameters &parameters) {
   std::string nn_graph_path = parameters.Get<std::string>("nn_graph_path");
   unsigned range = parameters.Get<unsigned>("R");
+
+  // 加载图。这个图是邻接list。记录每个节点对应的邻居id, 不包含原始向量数据。
   Load_nn_graph(nn_graph_path.c_str());
+  // 图中所有节点的原始向量数据
   data_ = data;
+  // 对应Algorithm 2的1-3行
   init_graph(parameters);
   SimpleNeighbor *cut_graph_ = new SimpleNeighbor[nd_ * (size_t)range];
   Link(parameters, cut_graph_);
   final_graph_.resize(nd_);
 
+  // 把得到的cut_graph_里的结果输出到final_graph_里。
   for (size_t i = 0; i < nd_; i++) {
     SimpleNeighbor *pool = cut_graph_ + i * (size_t)range;
     unsigned pool_size = 0;
@@ -424,6 +547,14 @@ void IndexNSG::Build(size_t n, const float *data, const Parameters &parameters) 
   has_built = true;
 }
 
+/*
+ * 贪婪算法，通过邻居的邻居找最近邻。
+ * 具体过程：从ep_开始。先把ep_的邻居加到结果集。如果个数不够L_search，再加入一些随机点。
+ * 然后通过邻居的邻居按照距离大小插入到结果集。如果超过L_search，就把距离最大的踢出去。
+ * query: 输入的单个查询向量
+ * x: index里原始向量数据。
+ * indices: 保存搜索结果
+ */ 
 void IndexNSG::Search(const float *query, const float *x, size_t K,
                       const Parameters &parameters, unsigned *indices) {
   const unsigned L = parameters.Get<unsigned>("L_search");
@@ -478,6 +609,7 @@ void IndexNSG::Search(const float *query, const float *x, size_t K,
         if (r < nk) nk = r;
       }
     }
+    // nk<=k，说明找到更小的距离，k从nk开始重新判断最近邻。
     if (nk <= k)
       k = nk;
     else
@@ -602,6 +734,12 @@ void IndexNSG::OptimizeGraph(float *data) {  // use after build or load
   CompactGraph().swap(final_graph_);
 }
 
+/*
+ * 深度遍历一个图。
+ * flag: 代表图中的节点是否访问过。
+ * root: 图的根节点，入口
+ * cnt: 返回访问过的节点数
+ */
 void IndexNSG::DFS(boost::dynamic_bitset<> &flag, unsigned root, unsigned &cnt) {
   unsigned tmp = root;
   std::stack<unsigned> s;
@@ -610,6 +748,7 @@ void IndexNSG::DFS(boost::dynamic_bitset<> &flag, unsigned root, unsigned &cnt) 
   flag[root] = true;
   while (!s.empty()) {
     unsigned next = nd_ + 1;
+    // 这个for循环为了找到当前节点的邻居里还没访问过的。去访问邻居的邻居。
     for (unsigned i = 0; i < final_graph_[tmp].size(); i++) {
       if (flag[final_graph_[tmp][i]] == false) {
         next = final_graph_[tmp][i];
@@ -617,6 +756,7 @@ void IndexNSG::DFS(boost::dynamic_bitset<> &flag, unsigned root, unsigned &cnt) 
       }
     }
     // std::cout << next <<":"<<cnt <<":"<<tmp <<":"<<s.size()<< '\n';
+    // 没找到还没访问过的邻居。
     if (next == (nd_ + 1)) {
       s.pop();
       if (s.empty()) break;
@@ -630,9 +770,15 @@ void IndexNSG::DFS(boost::dynamic_bitset<> &flag, unsigned root, unsigned &cnt) 
   }
 }
 
+/*
+ * 如果有无法走到的点，说明有些节点是不连通的。那么该无法走到的节点p，通过算法1找到他的已访问过的最近邻r，
+ * 把r的邻居里加入p。如果找不到r，就随机选择一个已经访问过的节点作为r，把r的邻居里加入p。
+ * 然后用r做入口，继续dfs做检查。直到满足所有节点都遍历过了。
+ */ 
 void IndexNSG::findroot(boost::dynamic_bitset<> &flag, unsigned &root,
                         const Parameters &parameter) {
   unsigned id = nd_;
+  // get the first node who cannot be visited.
   for (unsigned i = 0; i < nd_; i++) {
     if (flag[i] == false) {
       id = i;
@@ -666,6 +812,12 @@ void IndexNSG::findroot(boost::dynamic_bitset<> &flag, unsigned &root,
   }
   final_graph_[root].push_back(id);
 }
+/*
+ * 用导航点做根节点入口，通过DFS深度遍历更新后的图，来检查是否有节点无法走到，走到了就设置已访问标志为true。
+ * 如果有无法走到的点，说明有些节点是不连通的。那么该无法走到的节点p，通过算法1找到他的已访问过的最近邻r，
+ * 把r的邻居里加入p。如果找不到r，就随机选择一个已经访问过的节点作为r，把r的邻居里加入p。
+ * 然后用r做入口，继续dfs做检查。直到满足所有节点都遍历过了。
+ */ 
 void IndexNSG::tree_grow(const Parameters &parameter) {
   unsigned root = ep_;
   boost::dynamic_bitset<> flags{nd_, 0};
@@ -673,6 +825,7 @@ void IndexNSG::tree_grow(const Parameters &parameter) {
   while (unlinked_cnt < nd_) {
     DFS(flags, root, unlinked_cnt);
     // std::cout << unlinked_cnt << '\n';
+    // 如果访问过的节点数大于等于nd_，说明没有没连接上的节点，直接退出。
     if (unlinked_cnt >= nd_) break;
     findroot(flags, root, parameter);
     // std::cout << "new root"<<":"<<root << '\n';
